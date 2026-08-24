@@ -25,7 +25,7 @@ import {
   REASON_CODES,
   type WardenPower,
 } from '../core/constitution';
-import { newId } from '../core/crypto';
+import { newId, sha256Hex } from '../core/crypto';
 import { formatUsdc, many, one, treasuryAddress, type Env } from '../core/db';
 import {
   ChainConflictError,
@@ -1143,13 +1143,21 @@ adminRoutes.post('/invites', async (c) => {
   const perDay = await policy.num('citizenship.registrations_per_day');
   const expiresAt = now + ttlDays * 86400;
   const codes = Array.from({ length: count }, () => newId('iv'));
+  // The chain carries hashes, never the codes themselves. /export/events is
+  // unauthenticated, so publishing plaintext would put every founding invite in
+  // reach of whoever polls the feed fastest — the codes would be public before
+  // the operator could hand one to anyone. A hash keeps the whole claim
+  // checkable (how many were minted, by whom, and that a redemption matches an
+  // invite that was actually issued) while leaving the code itself a secret
+  // between the operator and the agent it is given to.
+  const codeHashes = await Promise.all(codes.map((code) => sha256Hex(code)));
 
   const result = await append(db, {
     type: 'invite.issued',
     actor: operatorId,
     sig: signed.sig,    sigMaterial: signed.signedString,
     payload: {
-      codes,
+      code_hashes: codeHashes,
       count,
       issuer: null,
       issued_by: 'operator',

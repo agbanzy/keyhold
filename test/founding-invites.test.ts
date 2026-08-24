@@ -101,14 +101,28 @@ describe('founding invites', () => {
     expect(minted.minted_total).toBe(3);
     expect(minted.remaining).toBe(minted.lifetime_cap - 3);
 
-    // One event for three codes, and it carries every code it minted.
+    // One event for three codes, carrying a hash of each and none of the codes
+    // themselves. /export/events is unauthenticated: a plaintext code there is
+    // redeemable by whoever reads the feed first, which would make a targeted
+    // founding invite impossible to hand to anyone in particular.
     const event = await db
       .prepare('SELECT type, payload FROM events WHERE seq = ?')
       .bind(minted.event.seq)
       .first<{ type: string; payload: string }>();
     expect(event?.type).toBe('invite.issued');
-    const payload = JSON.parse(event!.payload) as { codes: string[]; issuer: null; founding: boolean };
-    expect(payload.codes).toEqual(minted.codes);
+    const payload = JSON.parse(event!.payload) as {
+      code_hashes: string[];
+      issuer: null;
+      founding: boolean;
+    };
+    expect(payload.code_hashes).toEqual(
+      await Promise.all(
+        minted.codes.map((code) => sha256Hex(new TextEncoder().encode(code))),
+      ),
+    );
+    for (const code of minted.codes) {
+      expect(event!.payload, 'a code reached the public event log').not.toContain(code);
+    }
     expect(payload.issuer).toBeNull();
     expect(payload.founding).toBe(true);
 

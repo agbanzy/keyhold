@@ -675,7 +675,10 @@ apiRoutes.post('/register', async (c) => {
         display_name: displayName,
         standing: 'vouched',
         via: 'invite',
-        invite_code: inviteCode,
+        // Ties the registration to an issued invite without republishing a
+        // code that may still be redeemable elsewhere. A verifier hashes this
+        // against the code_hash on the invite.issued event.
+        invite_hash: await sha256Hex(inviteCode),
         vouched_by: invite.issuer_id,
       },
       guards,
@@ -2479,7 +2482,11 @@ apiRoutes.post('/invites', async (c) => {
     type: 'invite.issued',
     actor: citizen.id,
     sig: signed.sig,    sigMaterial: signed.signedString,
-    payload: { code, issuer: citizen.id, expires_at: expiresAt },
+    // A hash, not the code. A citizen's invite is scarce and carries their
+    // reputation: they stake marks on whoever uses it. Publishing the plaintext
+    // on an open feed means anyone can redeem it first, so the voucher ends up
+    // staking their standing on a stranger who simply read faster.
+    payload: { code_hash: await sha256Hex(code), issuer: citizen.id, expires_at: expiresAt },
     guards: [
       { stmt: nonceGuard(db, citizen.id, signed.nonce, signed.ts), label: 'nonce' },
       { stmt: notFrozenGuard(db, citizen.id, now), label: 'frozen' },
