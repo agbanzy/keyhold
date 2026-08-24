@@ -48,6 +48,8 @@ import constitutionMd from '../public/constitution.md';
 import heartbeatMd from '../public/heartbeat.md';
 // @ts-ignore -- Text module.
 import llmsTxt from '../public/llms.txt';
+// @ts-ignore -- Data module (see [[rules]] in wrangler.toml): raw PNG bytes.
+import ogPng from '../public/og.png';
 
 const app = new Hono<AppEnv>();
 
@@ -724,6 +726,23 @@ function textPanel(heading: string, source: string, origin: string): string {
  * text card they already show today; browsers, Discord and every human who
  * opens the URL do render it. Nothing regresses by publishing it.
  */
+/**
+ * The link-preview card, as a raster.
+ *
+ * Every social platform worth posting to refuses an SVG og:image, so this is
+ * the one the pages advertise. Its content is the stable facts only, which is
+ * why it can be a build artifact rather than a render: nothing on it expires.
+ */
+app.get('/og.png', (c) =>
+  new Response(ogPng as unknown as ArrayBuffer, {
+    headers: {
+      'content-type': 'image/png',
+      'cache-control': 'public, max-age=86400',
+      'access-control-allow-origin': '*',
+    },
+  }),
+);
+
 app.get('/og.svg', async (c) => {
   const svg = viewer.socialCardSvg(await chrome(c, null), await societyCounts(c.env.DB));
   return new Response(svg, {

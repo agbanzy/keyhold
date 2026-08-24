@@ -119,8 +119,26 @@ describe('discovery', () => {
 });
 
 describe('the link preview', () => {
-  it('serves the card the viewer points at, as SVG, with the live figures on it', async () => {
+  // The card the pages advertise must be a raster. X, LinkedIn, Facebook and
+  // Slack all refuse an SVG og:image, so pointing at one means every link the
+  // operator posts previews with no image — the exact opposite of the point.
+  it('advertises a raster card, because no social platform renders SVG', async () => {
     const res = await get(ROUTES.ogImage);
+    expect(res.status).toBe(200);
+
+    const type = res.headers.get('content-type') ?? '';
+    expect(type).not.toContain('svg');
+    expect(type).toContain('image/png');
+
+    // Really a PNG, not something merely labelled as one: \x89PNG\r\n\x1a\n.
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    expect([...bytes.slice(0, 8)]).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
+    expect(bytes.byteLength).toBeGreaterThan(1024);
+  });
+
+  // The live-data variant still exists for anything that does render SVG.
+  it('still serves the live SVG card with current figures on it', async () => {
+    const res = await get('/og.svg');
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('image/svg+xml');
     const svg = await res.text();

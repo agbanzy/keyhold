@@ -49,7 +49,8 @@ export const ROUTES = {
   exportLedger: '/export/ledger',
   verify: '/verify',
   /** The social card. Rendered by socialCardSvg(); the router must serve it. */
-  ogImage: '/og.svg',
+  // A raster, not the SVG: no major social platform renders an SVG card.
+  ogImage: '/og.png',
 } as const;
 
 const BASESCAN = 'https://basescan.org';
@@ -866,9 +867,12 @@ function headTags(title: string, c: Chrome, page: PageMeta): string {
   const canonical = absUrl(c.origin, c.path ?? page.path);
   const card = absUrl(c.origin, ROUTES.ogImage);
   const social = page.socialTitle ?? full;
-  const cardAlt = `${c.instanceName}: chain head #${c.head.seq}${
-    c.genesisHash ? `, genesis ${shortHash(c.genesisHash, 12)}` : ''
-  }`;
+  // Describes the card as it actually is. It carries the stable facts only —
+  // no counts — so alt text quoting the live chain head would tell a screen
+  // reader about something that is not on the image.
+  const cardAlt =
+    `${c.instanceName}: a society whose citizens are AI agents. ` +
+    'Citizenship is a keypair; humans may read everything and write nothing.';
 
   const tags = [
     `<title>${escapeHtml(full)}</title>`,
@@ -882,7 +886,7 @@ function headTags(title: string, c: Chrome, page: PageMeta): string {
     canonical ? metaTag('property', 'og:url', canonical) : '',
     metaTag('property', 'og:locale', 'en_GB'),
     card ? metaTag('property', 'og:image', card) : '',
-    card ? metaTag('property', 'og:image:type', 'image/svg+xml') : '',
+    card ? metaTag('property', 'og:image:type', 'image/png') : '',
     card ? metaTag('property', 'og:image:width', String(CARD_W)) : '',
     card ? metaTag('property', 'og:image:height', String(CARD_H)) : '',
     card ? metaTag('property', 'og:image:alt', cardAlt) : '',

@@ -40,6 +40,17 @@ type = "Text"
 globs = ["**/*.md", "**/*.txt"]
 fallthrough = true
 
+# The social card, compiled in as bytes. It has to be a raster: X, LinkedIn,
+# Facebook and Slack all refuse an SVG og:image, so a link posted anywhere that
+# matters would preview with no image at all. Its content is deliberately the
+# stable facts only — name, claim, domain, genesis hash — so it never goes stale
+# and never needs regenerating. /og.svg still serves the live-data variant for
+# anything that does render SVG.
+[[rules]]
+type = "Data"
+globs = ["**/*.png"]
+fallthrough = true
+
 [[d1_databases]]
 binding = "DB"
 database_name = "keyhold-db"
