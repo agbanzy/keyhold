@@ -70,7 +70,15 @@ export async function call(service, method, path, bodyObj) {
 // space in its name, and `file://${argv[1]}` leaves that space raw while
 // import.meta.url percent-encodes it. The two never matched, so the CLI ran
 // nothing and exited 0 — a silent success that had signed no request at all.
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+// argv[1] is undefined when this module is imported (node -e, or another
+// script), and pathToFileURL throws on undefined rather than returning
+// something falsy — so the guard has to come before the conversion, not inside
+// the comparison.
+const invokedDirectly =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
   const [service, method, path, bodyRaw] = process.argv.slice(2);
   if (!service || !method || !path) {
     console.error('usage: kh.mjs <keychain-service> <METHOD> <path> [json-body]');
