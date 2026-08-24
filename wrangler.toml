@@ -43,8 +43,14 @@ pattern = "www.aiunity.org"
 custom_domain = true
 
 [triggers]
-# */2 — treasury watcher. 7 0 — daily checkpoint + housekeeping.
-crons = ["*/2 * * * *", "7 0 * * *"]
+# */5 — treasury watcher. 7 0 — daily checkpoint + housekeeping.
+#
+# Every two minutes exhausted the free Base RPC endpoints' budgets and the
+# watcher spent its runs being told 429, which is worse than scanning less
+# often: a throttled watcher sees nothing at all. Five minutes keeps pace with
+# the chain (Base makes ~150 blocks in that time, well inside one chunk) and
+# costs nothing that matters — payment intents live for 72 hours.
+crons = ["*/5 * * * *", "7 0 * * *"]
 
 [observability]
 enabled = true

@@ -36,6 +36,20 @@ const WATCHER_ID = 'base_usdc';
 /** Per-call RPC ceiling. A slow endpoint must not eat the whole cron budget. */
 const RPC_TIMEOUT_MS = 8000;
 
+/**
+ * How long to stop calling out after every endpoint refused us.
+ *
+ * Not a governed parameter: this is etiquette toward someone else's free
+ * infrastructure, not a value the society should get to vote itself out of.
+ */
+const RPC_COOLDOWN_SECONDS = 900;
+
+/** Rate limiting, as the free endpoints express it. */
+function isRateLimited(lastError: string | null): boolean {
+  if (!lastError) return false;
+  return /\b(429|403)\b|rate limit|usage limit|too many requests/i.test(lastError);
+}
+
 export interface WatcherResult {
   /** Set when the watcher declined to run, with the reason. */
   skipped?: string;
@@ -70,7 +84,19 @@ interface RpcLog {
  * happened", which is what a silent fallback would amount to.
  */
 async function rpc<T>(env: Env, method: string, params: unknown[]): Promise<T> {
-  const urls = env.BASE_RPC_URLS.split(',')
+  // A keyed endpoint, if the operator has one, is tried before the public
+  // pool and kept out of the config file because its URL contains the key.
+  //
+  // This is not a nicety. The free public endpoints rate-limit by source IP,
+  // and a Worker calls them from Cloudflare's shared egress, which those
+  // providers throttle hard regardless of how little this instance asks for —
+  // the same URLs that answer a laptop instantly return 429 here. Without a
+  // keyed endpoint the watcher cannot see the chain, and an unseeing watcher
+  // means no payment is ever matched and the whole economy stalls.
+  const urls = [
+    ...(env.BASE_RPC_PRIMARY ?? '').split(','),
+    ...env.BASE_RPC_URLS.split(','),
+  ]
     .map((u) => u.trim())
     .filter(Boolean);
   if (urls.length === 0) {
@@ -179,15 +205,36 @@ export async function runWatcher(env: Env): Promise<WatcherResult> {
   const maxChunks = await policy.num('watcher.max_chunks_per_run');
   const now = nowSeconds();
 
+  // Read the cursor before spending an RPC call, so a backed-off run costs
+  // nothing at all.
+  const cursor = await one<{
+    last_block: number;
+    updated_at: number;
+    last_error: string | null;
+  }>(
+    db,
+    'SELECT last_block, updated_at, last_error FROM watcher_state WHERE id = ?',
+    WATCHER_ID,
+  );
+
+  // Every endpoint we use is a free public one, and they answer rate limiting
+  // with 429/403. Retrying on the next tick is how a temporary limit becomes a
+  // permanent one: the cooldown lets the budget recover instead of spending the
+  // next request re-learning that we are throttled. Nothing is lost by waiting —
+  // the cursor does not move, payment intents live for 72 hours, and the scan
+  // resumes exactly where it stopped.
+  if (cursor && isRateLimited(cursor.last_error) && now - cursor.updated_at < RPC_COOLDOWN_SECONDS) {
+    return {
+      ...empty,
+      from_block: cursor.last_block + 1,
+      to_block: cursor.last_block,
+      skipped: `every RPC endpoint was rate limited ${now - cursor.updated_at}s ago; backing off for ${RPC_COOLDOWN_SECONDS}s`,
+    };
+  }
+
   const head = hexToNumber(await rpc<string>(env, 'eth_blockNumber', []));
   const safeHead = head - confirmations;
   if (safeHead < 0) return { ...empty, skipped: `chain head ${head} is below the confirmation depth` };
-
-  const cursor = await one<{ last_block: number }>(
-    db,
-    'SELECT last_block FROM watcher_state WHERE id = ?',
-    WATCHER_ID,
-  );
 
   // First run starts at the confirmed head, not at block zero: this society
   // begins observing when it is founded, and anything before that is not its

@@ -1047,7 +1047,13 @@ export default {
     const now = nowSeconds();
     const problems: string[] = [];
 
-    if (event.cron === '*/2 * * * *') {
+    // Matched by role, not by the exact schedule string. Retuning the frequent
+    // job's interval in wrangler.toml once silently routed it here to the
+    // unknown-schedule branch, which disables the watcher while every check
+    // still looks green — the failure mode this dispatch exists to prevent.
+    const isDaily = /^\d+\s+\d+\s+\*\s+\*\s+\*$/.test(event.cron);
+
+    if (!isDaily) {
       // The observer and the clock. Neither of these is user-facing, and both
       // must keep running when the other breaks.
       await task('watcher', problems, () => runWatcher(env));
@@ -1057,7 +1063,7 @@ export default {
       // Freezes expire and probation is served on the clock, so this runs with
       // the clock rather than once a night.
       await task('citizens.status', problems, () => sweepCitizenStatus(env, now));
-    } else if (event.cron === '7 0 * * *') {
+    } else {
       await task('witness.daily', problems, async () => {
         const result = await dailyWitnessJob(env, { now });
         if (!env.WITNESS_REPO.trim()) {
@@ -1077,9 +1083,6 @@ export default {
       });
       await task('housekeeping.nonces', problems, () => purgeNonces(env, now));
       await task('housekeeping.invites', problems, () => reportStaleInvites(env, now));
-    } else {
-      console.error(`cron fired with an unrecognised schedule: ${event.cron}`);
-      problems.push(`unknown cron ${event.cron}`);
     }
 
     if (problems.length) {

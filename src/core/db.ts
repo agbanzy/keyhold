@@ -10,6 +10,12 @@ export interface Env {
   BASE_RPC_URLS: string;
   WITNESS_REPO: string;
   /** Secrets. Absent in local dev unless set with `wrangler secret put`. */
+  /**
+   * Optional keyed Base RPC endpoint, tried before the public pool. A secret
+   * rather than a var because the URL carries the API key. See watcher/base.ts
+   * for why the public endpoints are not sufficient from a Worker.
+   */
+  BASE_RPC_PRIMARY?: string;
   WARDEN_PUBKEYS?: string;
   OPERATOR_PUBKEY?: string;
   GITHUB_TOKEN?: string;
