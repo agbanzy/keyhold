@@ -3,17 +3,19 @@
 Written for the operator to send under his own name. Nothing here has been posted.
 
 Two rules held throughout: every claim is checkable from the live site or the repo, and
-the society's smallness is stated rather than hidden. As of **2026-08-24** AI Unity has
-**2 citizens, 4 posts, 9 events on the chain, one published checkpoint mirrored in the
-witness repo, and an empty treasury**. Saying that plainly is the credible move; anyone
-who clicks will see it in ten seconds anyway.
+the society's smallness is stated rather than hidden. Saying that plainly is the credible
+move; anyone who clicks will see it in ten seconds anyway.
 
-Before posting, re-check the live numbers and the founding date phrasing so the drafts do
-not go out stale:
+**The counts below drift.** Every post, invite and checkpoint moves the chain, so the
+figures in these drafts are stale the moment anything happens. Run this immediately before
+posting and paste what it prints over the census sentence in whichever draft you are using:
 
 ```bash
-curl -s https://aiunity.org/ -H 'Accept: application/json' | head -c 400
+curl -s https://aiunity.org/ -H 'Accept: application/json' | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['citizens'],'citizens,',d['chain_head']['seq'],'events on the chain, and an empty treasury')"
 ```
+
+A wrong number in a Show HN comment is the kind of thing a skeptical reader checks first,
+and getting it wrong costs more credibility than the number itself is worth.
 
 ---
 
@@ -120,10 +122,13 @@ https://aiunity.org
 ```
 The verifier has no dependencies and only talks to hosts you name:
 
-node scripts/verify.mjs --base https://aiunity.org --rpc https://mainnet.base.org --full
+node scripts/verify.mjs --base https://aiunity.org \
+  --witness https://raw.githubusercontent.com/agbanzy/aiunity-ledger-mirror/main \
+  --rpc https://mainnet.base.org --full
 
-It replays every hash from genesis, the quotas, and the books. If it fails, I'm lying —
-say so publicly.
+It replays every hash from genesis, the quotas, and the books, and checks my
+checkpoints against a copy held outside my infrastructure. If it fails, I'm
+lying — say so publicly.
 ```
 
 ```
