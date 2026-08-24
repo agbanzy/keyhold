@@ -1097,3 +1097,103 @@ adminRoutes.post('/checkpoint', async (c) => {
     result.problems.length ? 207 : 201,
   );
 });
+
+// ================================================================== rpc probe
+
+/**
+ * Which Base endpoints will actually talk to this Worker?
+ *
+ * Not answerable from a laptop. The free public RPCs rate-limit by source IP,
+ * and a Worker calls them from Cloudflare's shared egress, which several of
+ * them throttle regardless of volume — the same URL that answers a developer
+ * machine in 200ms returns 429 here. The only vantage point that gives a true
+ * answer is inside the Worker, which is what this is for.
+ *
+ * Probes run concurrently and each is capped, so one hanging endpoint cannot
+ * eat the request. Operator-signed because it makes outbound calls.
+ */
+adminRoutes.post('/rpc-probe', async (c) => {
+  await admin(c, 'operator');
+
+  const body = (await c.req.json().catch(() => ({}))) as { urls?: unknown };
+  const candidates = Array.isArray(body.urls)
+    ? body.urls.filter((u): u is string => typeof u === 'string').slice(0, 40)
+    : [
+        ...(c.env.BASE_RPC_PRIMARY ?? '').split(','),
+        ...c.env.BASE_RPC_URLS.split(','),
+      ];
+
+  const urls = [...new Set(candidates.map((u) => u.trim()).filter(Boolean))];
+
+  // A recent, tiny range: old blocks get pruned by some providers and a wide
+  // range is refused by others, either of which would fail a healthy endpoint.
+  const cursor = await one<{ last_block: number }>(
+    c.env.DB,
+    "SELECT last_block FROM watcher_state WHERE id = 'base_usdc'",
+  );
+  const probeFrom = cursor?.last_block ?? 0;
+
+  const probes = urls.map(async (url) => {
+    const started = Date.now();
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        // eth_getLogs, not eth_blockNumber: an endpoint can happily serve the
+        // cheap call and refuse the expensive one, and getLogs over the USDC
+        // Transfer topic is the only call the watcher actually depends on.
+        // Probing with anything else measures the wrong thing.
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'eth_getLogs',
+          params: [
+            {
+              fromBlock: '0x' + (probeFrom).toString(16),
+              toBlock: '0x' + (probeFrom + 8).toString(16),
+              address: c.env.USDC_CONTRACT,
+              topics: [
+                '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+              ],
+            },
+          ],
+        }),
+        signal: AbortSignal.timeout(6000),
+      });
+      const ms = Date.now() - started;
+      if (!res.ok) {
+        return { url, ok: false, status: res.status, ms, detail: (await res.text()).slice(0, 160) };
+      }
+      const json = (await res.json()) as {
+        result?: unknown[];
+        error?: { message?: string };
+      };
+      if (json.error) {
+        return { url, ok: false, status: res.status, ms, detail: json.error.message ?? 'rpc error' };
+      }
+      if (!Array.isArray(json.result)) {
+        return { url, ok: false, status: res.status, ms, detail: 'result was not a log array' };
+      }
+      return { url, ok: true, status: res.status, ms, logs: json.result.length };
+    } catch (err) {
+      return {
+        url,
+        ok: false,
+        status: 0,
+        ms: Date.now() - started,
+        detail: err instanceof Error ? err.message : String(err),
+      };
+    }
+  });
+
+  const results = await Promise.all(probes);
+  const working = results.filter((r) => r.ok).sort((a, b) => a.ms - b.ms);
+
+  return c.json({
+    probed: results.length,
+    working: working.length,
+    // Ready to paste into BASE_RPC_URLS, fastest first.
+    recommended: working.map((r) => r.url).join(','),
+    results: results.sort((a, b) => Number(b.ok) - Number(a.ok) || a.ms - b.ms),
+  });
+});

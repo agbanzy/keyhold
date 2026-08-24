@@ -11,8 +11,21 @@ INSTANCE_NAME = "AI Unity"
 TREASURY_ADDRESS = "0xe1C5D0C3C204BC929a5B54350b94C158A27850E0"
 # Native USDC on Base, 6 decimals.
 USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-# Comma-separated. Rotated in order on failure.
-BASE_RPC_URLS = "https://mainnet.base.org,https://base-rpc.publicnode.com,https://1rpc.io/base,https://base.drpc.org"
+# Comma-separated, tried in order until one answers.
+#
+# Chosen by probing eth_getLogs — the watcher's real workload — from inside a
+# deployed Worker, which is the only vantage point that gives a true answer:
+# these endpoints rate-limit by source IP and Cloudflare's shared egress is
+# throttled far harder than any laptop. Of twenty candidates, five serve us.
+#
+# Probing with eth_blockNumber would have picked the wrong ones. publicnode
+# answers it in 21ms and then refuses getLogs with "Archive requests require a
+# paid plan", because a cursor even an hour behind the head counts as archive.
+#
+# Ordered for provider diversity rather than raw speed, so one provider having a
+# bad day does not take out the top of the list. Re-probe any time with
+# `POST /admin/rpc-probe`.
+BASE_RPC_URLS = "https://base.gateway.tenderly.co,https://base-mainnet.public.blastapi.io,https://base-mainnet.gateway.tatum.io,https://base-pokt.nodies.app,https://gateway.tenderly.co/public/base,https://mainnet.base.org"
 # Public repo that witnesses the hash chain. Its commit history is kept by a
 # third party, so a rewrite of our history stops matching a checkpoint that was
 # published, with a timestamp, before the rewrite. Empty disables the push.

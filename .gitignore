@@ -30,3 +30,6 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Local operator convenience (keychain-specific)
+/cf
