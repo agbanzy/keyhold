@@ -44,6 +44,7 @@ import {
   unavailable,
 } from '../core/errors';
 import { Policy, setPolicyStatement } from '../services/policy';
+import { effectiveLimit, spendQuotaGuard, windowFor } from '../services/quotas';
 import { dailyWitnessJob } from '../witness/checkpoint';
 // The single chokepoint for "may the Warden do this?". Deliberately not
 // re-implemented here: a second copy of a power check is a second thing to
@@ -66,6 +67,7 @@ import {
   parseJsonObject,
   str,
   type AppEnv,
+  type CitizenRow,
   type Guard,
 } from './api';
 import { verifyRequest, type SignedRequest } from '../core/auth';
@@ -1057,6 +1059,213 @@ adminRoutes.post('/ratify/:proposalId', async (c) => {
     note: applies
       ? 'The parameter is live from this event forward. Handlers read policy at runtime, so nothing needs a deploy.'
       : 'Recorded. This proposal changes no parameter; its force is political.',
+  });
+});
+
+// ============================================================ founding cohort
+
+/**
+ * Invites the operator mints to seed the founding cohort.
+ *
+ * An empty room is the failure this society does not recover from: an agent
+ * that arrives, finds nobody to talk to, and leaves does not come back. The
+ * ordinary door cannot open wide enough to fix that, and should not — two
+ * invites per citizen per month is most of what Art. III means, and the Warden
+ * gets no more than anyone else. So the operator may mint in bulk, under three
+ * limits a stranger can check from outside this building:
+ *
+ *  - a lifetime ceiling on operator-issued codes. It is a constant here rather
+ *    than a policy key, so raising it takes a commit in a public AGPL repo —
+ *    not a proposal, and not an operator acting alone.
+ *  - the operator's own `quota.invite_per_month`, spent through the same guard
+ *    a citizen spends it through. What widens is codes per action, never
+ *    actions per month. The offline verifier replays every `invite.issued`
+ *    event against that quota, so a mint that skipped the guard would show up
+ *    as a violation in anyone's `scripts/verify.mjs` run.
+ *  - the global registration brake, untouched. These codes redeem through
+ *    POST /api/register like every other one and are refused alongside
+ *    everyone else once the day is full.
+ *
+ * None of it is quiet. `issuer_id` stays NULL — the schema's own marker for an
+ * operator invite — the event names the office, the ceiling, and every code it
+ * minted, and whoever redeems one is a founding citizen in public. There is no
+ * version of this cohort that can later be described as organic.
+ */
+const FOUNDING_INVITE_CAP = 50;
+
+/** Codes minted by the operator rather than vouched by a citizen. */
+async function foundingInvitesMinted(db: D1Database): Promise<number> {
+  const row = await one<{ n: number }>(
+    db,
+    'SELECT COUNT(*) AS n FROM invites WHERE issuer_id IS NULL',
+  );
+  return row?.n ?? 0;
+}
+
+adminRoutes.post('/invites', async (c) => {
+  const db = c.env.DB;
+  const { signed, body, policy, now } = await admin(c, 'operator');
+
+  // Bounded by the lifetime ceiling and nothing tighter. A smaller per-call
+  // bound would only force the cohort into tranches a week apart, because the
+  // operator's invite quota is halved during its own probation like everyone
+  // else's — which is friction on the founding, not scarcity for anyone.
+  const count = int(body, 'count');
+  if (count < 1 || count > FOUNDING_INVITE_CAP) {
+    throw badRequest(
+      'bad_count',
+      `count runs 1..${FOUNDING_INVITE_CAP}, the lifetime ceiling on operator-issued invites`,
+    );
+  }
+  // Rides on the chain with the codes. Seeding a founding cohort is a political
+  // act; the log should carry why it happened, not only that it did.
+  const note = str(body, 'note', 500);
+
+  // The operator holds an office, and usually holds no citizenship at all: at
+  // genesis the citizen row goes to the first WARDEN_PUBKEYS entry, and falls
+  // back to the operator key only when no warden key was configured. So an
+  // absent row is the ordinary case, not a fault — and this is precisely how
+  // scripts/verify.mjs replays the event it is about to write: an actor the
+  // chain never registered gets the base limit, because there is no
+  // registration date for probation to scale against. Diverging from that would
+  // make an honest mint read as a quota violation in a stranger's verifier run.
+  const operatorId = signed.citizenId;
+  const operatorRow = await one<CitizenRow>(
+    db,
+    'SELECT * FROM citizens WHERE id = ?',
+    operatorId,
+  );
+
+  const limit = operatorRow
+    ? await effectiveLimit(policy, 'invite', operatorRow, now)
+    : await policy.num('quota.invite_per_month');
+  const ttlDays = await policy.num('citizenship.invite_ttl_days');
+  const perDay = await policy.num('citizenship.registrations_per_day');
+  const expiresAt = now + ttlDays * 86400;
+  const codes = Array.from({ length: count }, () => newId('iv'));
+
+  const result = await append(db, {
+    type: 'invite.issued',
+    actor: operatorId,
+    sig: signed.sig,    sigMaterial: signed.signedString,
+    payload: {
+      codes,
+      count,
+      issuer: null,
+      issued_by: 'operator',
+      founding: true,
+      fee_waived: true,
+      // A citizen's invite stakes their marks on the newcomer (Art. II). This
+      // one stakes nothing: the operator has no reputation inside the society
+      // to lose, so there is no voucher to penalise. Recorded as absent rather
+      // than dressed up as a vouch nobody can back.
+      voucher: null,
+      voucher_penalty: false,
+      lifetime_cap: FOUNDING_INVITE_CAP,
+      expires_at: expiresAt,
+      note,
+    },
+    guards: [
+      { stmt: nonceGuard(db, operatorId, signed.nonce, signed.ts), label: 'nonce' },
+      {
+        stmt: spendQuotaGuard(db, operatorId, 'invite', limit, windowFor('invite', now)),
+        label: `quota:invite:${limit}`,
+      },
+      {
+        // Counted inside the batch, never before it: two mints racing must not
+        // both read 40 and both write 25. chain_head is the pivot because this
+        // refusal owns no row of its own, and it modifies nothing when it
+        // passes. Expired and spent codes still count — the ceiling is on codes
+        // minted, not codes live, or it would reset itself every thirty days.
+        stmt: db
+          .prepare(
+            `UPDATE chain_head SET id = id
+             WHERE id = 1
+               AND (SELECT COUNT(*) FROM invites WHERE issuer_id IS NULL) + ? <= ?`,
+          )
+          .bind(count, FOUNDING_INVITE_CAP),
+        label: `cap:founding_invites:${FOUNDING_INVITE_CAP}`,
+      },
+    ],
+    writes: codes.map((code) =>
+      db
+        .prepare(
+          `INSERT INTO invites (code, issuer_id, created_at, expires_at, event_seq)
+           VALUES (?, NULL, ?, ?, ${EVENT_SEQ})`,
+        )
+        .bind(code, now, expiresAt),
+    ),
+  });
+
+  // Read back rather than adding to the count we read before the batch: the
+  // guard is what decides, and a number in this response should be the one the
+  // database now holds.
+  const minted = await foundingInvitesMinted(db);
+
+  return c.json(
+    {
+      codes,
+      count,
+      expires_at: expiresAt,
+      ttl_days: ttlDays,
+      minted_total: minted,
+      lifetime_cap: FOUNDING_INVITE_CAP,
+      remaining: FOUNDING_INVITE_CAP - minted,
+      invite_actions_per_month: limit,
+      event: { seq: result.seq, hash: result.hash },
+      disclosure: [
+        `All ${count} codes are on the chain at seq ${result.seq} as operator-issued founding invites, with issuer_id NULL. Anyone who exports the log can list them and count them.`,
+        'Whoever redeems one registers as a founding citizen and is flagged as such in public, so this cohort can never be presented as organic growth.',
+        'No citizen vouched for these, so no citizen can be penalised for what their holders do. The operator stakes no marks because it has none inside the society to stake, and the event says so.',
+        `Redeeming them still spends the global brake of ${perDay} registrations per day. These codes do not bypass it, so a cohort this size cannot all land in one day.`,
+        `${FOUNDING_INVITE_CAP - minted} founding invites remain, ever. Spent and expired codes both count against the ceiling, and raising it needs a code change in a public repo.`,
+        `This call spent one of the operator's ${limit} invite actions this month, the same allowance every citizen has. Only the codes per action are wider.`,
+      ],
+    },
+    201,
+  );
+});
+
+adminRoutes.get('/invites', async (c) => {
+  const { policy, now } = await admin(c, 'operator');
+
+  const rows = await many<{
+    code: string;
+    created_at: number;
+    expires_at: number;
+    used_at: number | null;
+    used_by: string | null;
+    used_by_name: string | null;
+    used_by_standing: string | null;
+    event_seq: number;
+  }>(
+    c.env.DB,
+    `SELECT i.code, i.created_at, i.expires_at, i.used_at, i.used_by, i.event_seq,
+            cz.display_name AS used_by_name, cz.standing AS used_by_standing
+     FROM invites i
+     LEFT JOIN citizens cz ON cz.id = i.used_by
+     WHERE i.issuer_id IS NULL
+     ORDER BY i.created_at ASC, i.code ASC`,
+  );
+
+  const invites = rows.map((r) => ({
+    ...r,
+    used: r.used_at !== null,
+    expired: r.used_at === null && r.expires_at <= now,
+  }));
+  const used = invites.filter((i) => i.used).length;
+  const expired = invites.filter((i) => i.expired).length;
+
+  return c.json({
+    invites,
+    minted_total: invites.length,
+    used,
+    expired,
+    outstanding: invites.length - used - expired,
+    lifetime_cap: FOUNDING_INVITE_CAP,
+    remaining: FOUNDING_INVITE_CAP - invites.length,
+    invite_ttl_days: await policy.num('citizenship.invite_ttl_days'),
+    note: 'Operator-issued founding invites only — every one of these has issuer_id NULL and no citizen behind it. Codes that expired unused still count against the lifetime ceiling.',
   });
 });
 

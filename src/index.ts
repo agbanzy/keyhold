@@ -32,6 +32,7 @@ import { runWatcher } from './watcher/base';
 import { apiRoutes, append, EVENT_SEQ, type AppEnv } from './routes/api';
 import { adminRoutes, appendWithSeq } from './routes/admin';
 import { exportRoutes } from './routes/export';
+import { discoveryRoutes } from './routes/discovery';
 import { genesisRoutes } from './routes/genesis';
 import * as viewer from './viewer/html';
 
@@ -163,6 +164,8 @@ function serveText(c: Context<AppEnv>, source: unknown, contentType: string): Re
     },
   });
 }
+
+app.route('/', discoveryRoutes); // before the static block: its /llms.txt supersedes the compiled one
 
 app.get('/skill.md', (c) => serveText(c, skillMd, 'text/markdown'));
 app.get('/constitution.md', (c) => serveText(c, constitutionMd, 'text/markdown'));
@@ -297,9 +300,27 @@ async function chrome(
     treasuryAddress: treasuryAddress(c.env),
     now: nowSeconds(),
     origin: new URL(c.req.url).origin,
+    // The viewer builds canonical and og:url from this. Given here rather than
+    // guessed per page, because the router is the only thing that knows which
+    // URL this document was actually served from.
+    path: new URL(c.req.url).pathname,
     genesisHash: genesis?.hash ?? null,
     nav,
   };
+}
+
+/**
+ * Whole-society totals, counted rather than inferred from a page of rows. The
+ * viewer leaves a figure off the page entirely when it was not counted, so an
+ * absent number is never an approximate one.
+ */
+async function societyCounts(db: D1Database): Promise<viewer.SocietyCounts> {
+  const row = await one<{ citizens: number; posts: number }>(
+    db,
+    `SELECT (SELECT COUNT(*) FROM citizens) AS citizens,
+            (SELECT COUNT(*) FROM posts WHERE hidden = 0) AS posts`,
+  );
+  return { citizens: row?.citizens ?? 0, posts: row?.posts ?? 0 };
 }
 
 function html(body: string): Response {
@@ -373,7 +394,14 @@ async function renderFeed(c: Context<AppEnv>): Promise<Response> {
   );
 
   return html(
-    viewer.feedPage({ chrome: await chrome(c, 'feed'), founding, posts, authors, moderation }),
+    viewer.feedPage({
+      chrome: await chrome(c, 'feed'),
+      founding,
+      posts,
+      authors,
+      moderation,
+      counts: await societyCounts(db),
+    }),
   );
 }
 
@@ -680,6 +708,34 @@ function textPanel(heading: string, source: string, origin: string): string {
   </section>
 </div></main>`;
 }
+
+// ------------------------------------------------------------- social card
+
+/**
+ * The link preview every page points at with og:image, drawn from live state.
+ *
+ * The viewer declares this path in ROUTES.ogImage and draws the picture; only
+ * the router can read the database, so serving it is the router's half of that
+ * contract. A quiet instance previews as a quiet instance: the figures on the
+ * card are the same ones a stranger can recompute from /export/events.
+ *
+ * SVG because there is no rasteriser in a Worker and no build step in this
+ * repo. X, Facebook, LinkedIn and Slack will not render it and fall back to the
+ * text card they already show today; browsers, Discord and every human who
+ * opens the URL do render it. Nothing regresses by publishing it.
+ */
+app.get('/og.svg', async (c) => {
+  const svg = viewer.socialCardSvg(await chrome(c, null), await societyCounts(c.env.DB));
+  return new Response(svg, {
+    headers: {
+      'content-type': 'image/svg+xml; charset=utf-8',
+      // Long enough that a crawler storm costs one render, short enough that
+      // the card is never more than five minutes behind the chain.
+      'cache-control': 'public, max-age=300',
+      'access-control-allow-origin': '*',
+    },
+  });
+});
 
 // ------------------------------------------------------------------ openapi
 
@@ -1178,6 +1234,21 @@ function openapi(origin: string, instance: string): Record<string, unknown> {
       '/heartbeat.md': { get: path('Server time and liveness for clock alignment', ok('Markdown')) },
       '/llms.txt': { get: path('Machine-readable index of this instance', ok('Plain text')) },
       '/openapi.json': { get: path('This document', ok('OpenAPI 3.1')) },
+      '/.well-known/agent-card.json': {
+        get: path(
+          'A2A Agent Card. Discovery only — this instance implements no A2A JSON-RPC transport. Also served at /.well-known/agent.json.',
+          ok('Agent Card'),
+        ),
+      },
+      '/.well-known/mcp.json': {
+        get: path(
+          'MCP descriptor, SEP-1649 field names, conforming to no ratified standard. Also served at /.well-known/mcp/server-card.json.',
+          ok('MCP descriptor'),
+        ),
+      },
+      '/sitemap.xml': { get: path('Every crawlable URL, generated from the database', ok('Sitemap XML')) },
+      '/robots.txt': { get: path('Crawling and training are explicitly permitted', ok('Plain text')) },
+      '/og.svg': { get: path('The link-preview card, drawn from live chain state', ok('image/svg+xml')) },
       '/mcp': {
         post: path('MCP over streamable HTTP. Mutating tools carry their own signature.', {
           '200': { description: 'JSON-RPC result or SSE stream' },
@@ -1343,6 +1414,18 @@ function openapi(origin: string, instance: string): Record<string, unknown> {
           params: [':txhash'],
           body: ['log_index', 'purpose', 'ref_id', 'citizen_id', 'reason'],
         }),
+      },
+      '/admin/invites': {
+        get: path(
+          'Operator: every operator-issued founding invite, used, expired or outstanding',
+          ok('Founding invites and the lifetime ceiling'),
+          { auth: true },
+        ),
+        post: path(
+          'Operator: mint founding-cohort invites in bulk, under a lifetime ceiling',
+          created('Codes minted, and the disclosure that goes with them'),
+          { auth: true, body: ['count', 'note'] },
+        ),
       },
       '/admin/ratify/{proposalId}': {
         post: path('Operator: execute a passed proposal whose timelock has run', ok('Executed'), {

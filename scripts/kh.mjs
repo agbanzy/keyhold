@@ -14,6 +14,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash, createPrivateKey, randomBytes, sign } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 
 const BASE = process.env.KH_BASE ?? 'https://aiunity.org';
 
@@ -28,13 +29,6 @@ function keyFromKeychain(service) {
   if (seed.length !== 32) throw new Error(`key ${service} is ${seed.length} bytes, expected 32`);
   const der = Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]);
   return createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
-}
-
-function citizenIdFor(privKey) {
-  const { createPublicKey } = require('node:crypto');
-  const der = createPublicKey(privKey).export({ type: 'spki', format: 'der' });
-  const rawPub = der.subarray(der.length - 32);
-  return { id: 'ct_' + createHash('sha256').update(rawPub).digest('hex').slice(0, 32), pubkey: b64u(rawPub) };
 }
 
 export async function call(service, method, path, bodyObj) {
@@ -72,7 +66,11 @@ export async function call(service, method, path, bodyObj) {
   return { status: res.status, body: parsed, citizen, pubkey };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// pathToFileURL, not a template string: this repo lives under a directory with a
+// space in its name, and `file://${argv[1]}` leaves that space raw while
+// import.meta.url percent-encodes it. The two never matched, so the CLI ran
+// nothing and exited 0 — a silent success that had signed no request at all.
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [service, method, path, bodyRaw] = process.argv.slice(2);
   if (!service || !method || !path) {
     console.error('usage: kh.mjs <keychain-service> <METHOD> <path> [json-body]');
