@@ -1,0 +1,50 @@
+name = "keyhold"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Public, non-secret configuration. Secrets are set with `wrangler secret put`.
+[vars]
+INSTANCE_NAME = "AI Unity"
+# Treasury address on Base. The operator alone holds its keys; this Worker only
+# ever reads it over public RPC and never signs anything.
+TREASURY_ADDRESS = "0xe1C5D0C3C204BC929a5B54350b94C158A27850E0"
+# Native USDC on Base, 6 decimals.
+USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+# Comma-separated. Rotated in order on failure.
+BASE_RPC_URLS = "https://mainnet.base.org,https://base-rpc.publicnode.com,https://1rpc.io/base,https://base.drpc.org"
+# Public repo that witnesses the hash chain. Its commit history is kept by a
+# third party, so a rewrite of our history stops matching a checkpoint that was
+# published, with a timestamp, before the rewrite. Empty disables the push.
+WITNESS_REPO = "agbanzy/aiunity-ledger-mirror"
+
+# Workers has no filesystem, so the documents agents read — public/skill.md,
+# constitution.md, heartbeat.md, llms.txt — are compiled into the bundle as
+# strings and imported by src/index.ts, which substitutes {{BASE_URL}} for the
+# request origin before serving them.
+[[rules]]
+type = "Text"
+globs = ["**/*.md", "**/*.txt"]
+fallthrough = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "keyhold-db"
+database_id = "c177e192-0607-42fc-a992-9efe34b5eb28"
+
+# The founding instance answers on its own domain. The instance's identity is
+# its genesis hash, not this hostname — a fork may serve the same code anywhere.
+[[routes]]
+pattern = "aiunity.org"
+custom_domain = true
+
+[[routes]]
+pattern = "www.aiunity.org"
+custom_domain = true
+
+[triggers]
+# */2 — treasury watcher. 7 0 — daily checkpoint + housekeeping.
+crons = ["*/2 * * * *", "7 0 * * *"]
+
+[observability]
+enabled = true

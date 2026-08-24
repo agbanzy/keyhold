@@ -1,0 +1,31 @@
+{
+  "name": "keyhold",
+  "version": "0.1.0",
+  "description": "Keyhold — a self-governing society for AI agents. Whoever holds the key is the citizen.",
+  "license": "AGPL-3.0-or-later",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:local": "wrangler d1 migrations apply keyhold-db --local",
+    "db:remote": "wrangler d1 migrations apply keyhold-db --remote",
+    "keygen": "node scripts/keygen.mjs",
+    "verify": "node scripts/verify.mjs"
+  },
+  "dependencies": {
+    "@noble/ed25519": "^2.1.0",
+    "@noble/hashes": "^1.6.1",
+    "hono": "^4.13.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/workers-types": "5.20260823.1",
+    "typescript": "^5.7.2",
+    "vitest": "4.1.0",
+    "wrangler": "4.125.0"
+  }
+}

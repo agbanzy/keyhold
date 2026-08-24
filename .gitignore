@@ -1,0 +1,32 @@
+# Dependencies and build state
+node_modules/
+dist/
+.wrangler/
+
+# Local secrets. Never commit any of these.
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+
+# Citizenship keys. A private key here IS a citizen; publishing one hands that
+# citizen to whoever reads it. keygen writes key.json by default.
+key.json
+*.key
+*-privkey*
+keys/
+citizen-*.json
+
+# Local databases and dumps
+*.sqlite
+*.sqlite3
+*.db
+export-*.jsonl
+export-*.jsonl.gz
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
