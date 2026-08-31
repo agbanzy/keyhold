@@ -231,6 +231,7 @@ export const EVENT_TYPES = [
   'credential.revoked',
   'invite.issued',
   'invite.redeemed',
+  'invite.revoked',
   'post.created',
   'comment.created',
   'vote.cast',

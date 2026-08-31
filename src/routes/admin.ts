@@ -1414,3 +1414,76 @@ adminRoutes.post('/rpc-probe', async (c) => {
     results: results.sort((a, b) => Number(b.ok) - Number(a.ok) || a.ms - b.ms),
   });
 });
+
+/**
+ * Revoke an invite that should no longer be redeemable.
+ *
+ * This exists because of a real incident rather than a hypothetical: the first
+ * three founding invites were minted before invite payloads carried a hash
+ * instead of the code, so their plaintext sits in event seq 10 forever. The log
+ * is append-only and that is the point — history is not rewritten to tidy away
+ * a mistake. What can be done is to stop the exposed codes being spendable, in
+ * public, as its own event.
+ *
+ * Revoking spends nothing and un-spends nothing: the lifetime founding ceiling
+ * counts codes minted, so a revoked code stays counted. Cancelling a mistake
+ * does not buy back the allowance.
+ */
+adminRoutes.post('/invites/:code/revoke', async (c) => {
+  const db = c.env.DB;
+  const { signed, body, now } = await admin(c, 'operator');
+
+  const code = c.req.param('code');
+  const reason = str(body, 'reason', 500);
+
+  const invite = await one<{ code: string; used_at: number | null; issuer_id: string | null }>(
+    db,
+    'SELECT code, used_at, issuer_id FROM invites WHERE code = ?',
+    code,
+  );
+  if (!invite) throw notFound('no_such_invite', `no invite ${code}`);
+  if (invite.used_at !== null) {
+    throw conflict(
+      'already_redeemed',
+      'that invite was already used; revoking it now would not un-make the citizen it created',
+    );
+  }
+
+  const result = await append(db, {
+    type: 'invite.revoked',
+    actor: signed.citizenId,
+    sig: signed.sig,
+    sigMaterial: signed.signedString,
+    payload: {
+      code_hash: await sha256Hex(code),
+      was_founding: invite.issuer_id === null,
+      reason,
+      revoked_at: now,
+    },
+    guards: [
+      { stmt: nonceGuard(db, signed.citizenId, signed.nonce, signed.ts), label: 'nonce' },
+      // Expiring it in the past is the revocation: every redemption path already
+      // refuses an expired invite, so there is one rule to get right, not two.
+      // Conditional on it still being unused, so a redemption racing this loses.
+      {
+        stmt: db
+          .prepare(
+            `UPDATE invites SET expires_at = ?
+             WHERE code = ? AND used_at IS NULL AND expires_at > ?`,
+          )
+          .bind(now - 1, code, now),
+        label: 'state:invite',
+      },
+    ],
+  });
+
+  return c.json(
+    {
+      code,
+      revoked: true,
+      event: { seq: result.seq, hash: result.hash },
+      note: 'The code is no longer redeemable. It stays on the chain, and it still counts against the founding ceiling — revoking a mistake does not refund the allowance.',
+    },
+    201,
+  );
+});
