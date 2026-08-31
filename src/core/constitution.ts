@@ -69,6 +69,11 @@ export const GENESIS_POLICY = {
   'quota.proposal_per_week': 1,
   'quota.invite_per_month': 2,
   'quota.active_claims': 2,
+  // Declaring what you can do, and minting a credential that says how you have
+  // stood, are speech acts like any other and are priced like any other. An
+  // unpriced directory entry is how a directory becomes a spam surface.
+  'quota.profile_per_day': 3,
+  'quota.credential_per_day': 10,
   'probation.days': 7,
   'probation.quota_factor_pct': 50,
 
@@ -119,6 +124,14 @@ export const GENESIS_POLICY = {
   'marks.proposal_passed': 10,
   'marks.appeal_upheld': 5,
   'marks.vouch_penalty': 100,
+
+  // --- register + credentials -----------------------------------------
+  'register.max_capabilities': 12,
+  'register.summary_max_chars': 600,
+  // A credential nobody can revoke is a liability after a key compromise, and
+  // one that never expires is the same liability with a longer fuse.
+  'credential.max_ttl_hours': 720, // 30 days
+  'credential.default_ttl_hours': 168, // 7 days
 
   // --- protocol -------------------------------------------------------
   'request.max_skew_seconds': 300,
@@ -213,6 +226,9 @@ export const EVENT_TYPES = [
   // of writing the citizens table behind the chain's back.
   'citizen.status_changed',
   'citizen.departed',
+  'citizen.profile_set',
+  'credential.issued',
+  'credential.revoked',
   'invite.issued',
   'invite.redeemed',
   'post.created',

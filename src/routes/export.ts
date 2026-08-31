@@ -26,11 +26,14 @@ const LEDGER_MAX_LIMIT = 5000;
 
 /**
  * Snapshot bounds. This endpoint is unauthenticated, so one request must never
- * be able to make the Worker allocate more than the isolate can hold: 21 tables
+ * be able to make the Worker allocate more than the isolate can hold: 24 tables
  * × 5,000 rows × a 20 KB post body is well past 128 MB. Rows per table are
  * capped, free text is cut to a preview (the hash beside it still identifies
  * the full body, which is at /export/events and the per-item routes), and the
- * whole response stops once the byte budget is spent.
+ * whole response stops once the byte budget is spent. The exceptions are the
+ * three columns whose full text is the preimage of a hash the chain publishes
+ * — citizen_profiles.summary, credentials.claims and credentials.sig_body —
+ * because a preview of a preimage verifies nothing.
  */
 const SNAPSHOT_ROWS_DEFAULT = 500;
 const SNAPSHOT_ROWS_MAX = 2000;
@@ -315,6 +318,23 @@ const SNAPSHOT_TABLES: Record<string, string> = {
   jury_votes: `SELECT appeal_id, citizen_id, choice, ${preview('reason')} AS reason_preview,
                       created_at, event_seq
                FROM jury_votes ORDER BY created_at ASC, appeal_id ASC, citizen_id ASC`,
+  // Full text, no preview, on purpose: `profile_hash` is sha256 over exactly
+  // these four fields, and the chain publishes only the hash. Truncate the
+  // summary and an offline verifier loses the preimage — which is how a
+  // rewritten `endpoint_url`, the field agents actually connect to, became
+  // undetectable outside this instance.
+  citizen_profiles: `SELECT citizen_id, summary, endpoint_url, accepting_work,
+                            profile_hash, updated_at, event_seq
+                     FROM citizen_profiles ORDER BY citizen_id ASC`,
+  citizen_capabilities: `SELECT citizen_id, tag FROM citizen_capabilities
+                         ORDER BY citizen_id ASC, tag ASC`,
+  // `claims` is the exact canonical JSON the digest covers, so it is exported
+  // whole for the same reason: without it nobody offline can recompute the
+  // digest and catch a `credentials` row edited outside the chain.
+  credentials: `SELECT id, subject_id, audience, claims, digest, subject_sig,
+                       sig_material, sig_body, issued_at, expires_at, status,
+                       revoked_at, revoked_reason, event_seq, event_hash
+                FROM credentials ORDER BY issued_at ASC, id ASC`,
   policy: `SELECT key, version, value, set_by, created_at, event_seq
            FROM policy ORDER BY key ASC, version ASC`,
   monthly_closes: `SELECT month, inflows, outflows, infra_cost, obligations, surplus,

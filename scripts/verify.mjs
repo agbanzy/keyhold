@@ -97,6 +97,8 @@ const FALLBACK_POLICY = {
   'quota.active_claims': 2,
   'probation.days': 7,
   'probation.quota_factor_pct': 50,
+  'quota.profile_per_day': 3,
+  'quota.credential_per_day': 10,
 };
 
 /** event type -> the quota it must have spent. Mirrors services/quotas.ts. */
@@ -114,6 +116,11 @@ const QUOTA_EVENTS = {
     key: 'quota.invite_per_month',
     window: 'month',
   },
+  // Being findable and being citable elsewhere are priced like speech, so the
+  // replay measures them like speech. An instance that quietly let one citizen
+  // spam the register or mint credentials past its own limit shows up here.
+  'citizen.profile_set': { action: 'profile', key: 'quota.profile_per_day', window: 'day' },
+  'credential.issued': { action: 'credential', key: 'quota.credential_per_day', window: 'day' },
 };
 
 /** Ids beyond this are not tracked for the deletion cross-check; see check 6. */
@@ -748,6 +755,11 @@ async function main() {
     modUnhideWithoutHide: [],
     modOrphanTargets: [],
     hideTargets: new Set(),
+    // check 7
+    profileHash: new Map(), // citizen id -> {seq, hash, capabilities}
+    mintedDigests: new Map(), // digest -> {seq, expires_at, marks, standing}
+    revokedDigests: new Map(), // digest -> seq
+    revokedIds: new Map(), // credential id -> seq (events minted before the id came off the chain)
   };
 
   for await (const e of streamEvents(opts.base, opts.limit)) {
@@ -830,6 +842,9 @@ async function main() {
 
     // ---- 6. MODERATION ---------------------------------------------------
     absorbModeration(state, e);
+
+    // ---- 7. REGISTER + CREDENTIALS ---------------------------------------
+    absorbRegister(state, e);
   }
 
   if (state.count === 0) {
@@ -858,6 +873,9 @@ async function main() {
 
   // -------------------------------------------------------- 6. MODERATION
   await checkModeration(report, opts, state);
+
+  // -------------------------------------- 7. REGISTER + CREDENTIALS
+  await checkRegister(report, opts, state);
 
   report.finish();
 }
@@ -1700,6 +1718,180 @@ async function checkModeration(report, opts, state) {
   report.pass(
     'moderation',
     `${state.modActions} moderation action(s), all with Article IV reason codes; ${state.hidden.size} item(s) currently hidden, none deleted`,
+  );
+}
+
+// ------------------------------------------- check 7: register + credentials
+
+/**
+ * The chain publishes hashes; the tables hold the preimages. Neither half
+ * proves anything alone, and until these two were compared a `citizen_profiles`
+ * row rewritten outside the chain — a redirected `endpoint_url`, which is the
+ * field agents actually connect to — was undetectable from out here, and a
+ * rewritten `credentials` row with a freshly recomputed digest was certified by
+ * the instance's own verify endpoint.
+ */
+function absorbRegister(state, e) {
+  if (e.type === 'citizen.profile_set' && e.actor) {
+    state.profileHash.set(e.actor, {
+      seq: e.seq,
+      hash: e.payload?.profile_hash,
+      capabilities: Array.isArray(e.payload?.capabilities) ? e.payload.capabilities : null,
+      accepting_work: e.payload?.accepting_work === true,
+    });
+  }
+  if (e.type === 'credential.issued' && typeof e.payload?.digest === 'string') {
+    state.mintedDigests.set(e.payload.digest, {
+      seq: e.seq,
+      expires_at: e.payload.expires_at,
+      marks: e.payload.marks,
+      standing: e.payload.standing,
+    });
+  }
+  if (e.type === 'credential.revoked') {
+    // A chain is append-only, so every shape it has ever carried is permanent.
+    // Revocations minted before the credential id came off the public log name
+    // the credential by id; ones after it name the digest. Both are read here,
+    // because a verifier that only understands today's payload reports the
+    // history it cannot parse as a discrepancy.
+    if (typeof e.payload?.digest === 'string') {
+      state.revokedDigests.set(e.payload.digest, e.seq);
+    }
+    if (typeof e.payload?.id === 'string') {
+      state.revokedIds.set(e.payload.id, e.seq);
+    }
+  }
+}
+
+function profileHashOf(row, capabilities) {
+  return sha256Hex(
+    'KEYHOLD1-PROFILE\n' +
+      canonicalize({
+        accepting_work: row.accepting_work === 1 || row.accepting_work === true,
+        capabilities,
+        endpoint_url: row.endpoint_url ?? null,
+        summary: row.summary,
+      }),
+  );
+}
+
+async function snapshotTable(base, name) {
+  const data = await getJson(`${base}/export/snapshot?table=${name}&limit=2000`, {
+    optional: true,
+  });
+  const rows = data?.tables?.[name];
+  return Array.isArray(rows) ? rows : null;
+}
+
+async function checkRegister(report, opts, state) {
+  const declared = state.profileHash.size;
+  const minted = state.mintedDigests.size;
+
+  if (declared === 0 && minted === 0) {
+    report.skip('register', 'nothing declared and nothing minted yet');
+    return;
+  }
+
+  const profiles = await snapshotTable(opts.base, 'citizen_profiles');
+  const capRows = await snapshotTable(opts.base, 'citizen_capabilities');
+  const creds = await snapshotTable(opts.base, 'credentials');
+
+  if (profiles === null && creds === null) {
+    report.warn(
+      'register',
+      `${declared} declaration(s) and ${minted} credential(s) on the chain, but /export/snapshot does not serve citizen_profiles or credentials — the preimages of those hashes are not published, so what the register SHOWS cannot be checked against what the chain RECORDED`,
+    );
+    return;
+  }
+
+  const failures = [];
+  let profilesChecked = 0;
+  let credsChecked = 0;
+
+  if (profiles) {
+    const caps = new Map();
+    for (const r of capRows ?? []) {
+      if (!caps.has(r.citizen_id)) caps.set(r.citizen_id, []);
+      caps.get(r.citizen_id).push(r.tag);
+    }
+    for (const row of profiles) {
+      const chain = state.profileHash.get(row.citizen_id);
+      if (!chain) {
+        failures.push(
+          `${row.citizen_id} has a register entry but no citizen.profile_set in the chain wrote it — the declaration was written outside the chain`,
+        );
+        continue;
+      }
+      const tags = (caps.get(row.citizen_id) ?? []).slice().sort();
+      if (chain.capabilities && chain.capabilities.join(',') !== tags.join(',')) {
+        failures.push(
+          `${row.citizen_id} is listed under [${tags.join(', ')}] but the chain recorded [${chain.capabilities.join(', ')}] at seq ${chain.seq}`,
+        );
+      }
+      const recomputed = profileHashOf(row, chain.capabilities ?? tags);
+      if (row.profile_hash !== chain.hash) {
+        failures.push(
+          `${row.citizen_id} serves profile_hash ${short(row.profile_hash)} but the chain published ${short(chain.hash)} at seq ${chain.seq}`,
+        );
+      } else if (recomputed !== chain.hash) {
+        failures.push(
+          `${row.citizen_id}: the summary/endpoint_url/accepting_work served do NOT hash to the profile_hash the chain published at seq ${chain.seq} — the entry was edited outside the chain (recomputed ${short(recomputed)})`,
+        );
+      }
+      profilesChecked += 1;
+    }
+  }
+
+  if (creds) {
+    for (const row of creds) {
+      const chain = state.mintedDigests.get(row.digest);
+      if (!chain) {
+        failures.push(
+          `credential ${row.id} carries digest ${short(row.digest)}, which no credential.issued event in the chain ever minted — the row was written or altered outside the chain`,
+        );
+        continue;
+      }
+      let recomputed;
+      try {
+        recomputed = sha256Hex('KEYHOLD1-CREDENTIAL\n' + canonicalize(JSON.parse(row.claims)));
+      } catch (err) {
+        failures.push(`credential ${row.id}: claims are not canonical JSON (${String(err?.message ?? err)})`);
+        continue;
+      }
+      if (recomputed !== row.digest) {
+        failures.push(
+          `credential ${row.id}: the claims served do not hash to the digest beside them (${short(recomputed)} vs ${short(row.digest)})`,
+        );
+      }
+      if (Number(row.event_seq) !== chain.seq) {
+        failures.push(
+          `credential ${row.id} names event ${row.event_seq}; the chain minted that digest at ${chain.seq}`,
+        );
+      }
+      const revokedAt = state.revokedDigests.get(row.digest) ?? state.revokedIds.get(row.id);
+      if (row.status === 'revoked' && revokedAt === undefined) {
+        failures.push(`credential ${row.id} is served as revoked but no credential.revoked event withdrew it`);
+      }
+      if (revokedAt !== undefined && row.status !== 'revoked') {
+        failures.push(
+          `credential ${row.id} was revoked on the chain at seq ${revokedAt} but is still served as ${row.status}`,
+        );
+      }
+      credsChecked += 1;
+    }
+  }
+
+  if (failures.length) {
+    report.fail(
+      'register',
+      `${failures.length} register/credential row(s) disagree with the chain`,
+      failures,
+    );
+    return;
+  }
+  report.pass(
+    'register',
+    `${profilesChecked} declaration(s) and ${credsChecked} credential(s) hash to exactly what the chain recorded`,
   );
 }
 

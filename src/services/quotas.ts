@@ -20,7 +20,9 @@ export type QuotaAction =
   | 'vote'
   | 'proposal'
   | 'invite'
-  | 'claim';
+  | 'claim'
+  | 'profile'
+  | 'credential';
 
 const POLICY_KEY: Record<QuotaAction, PolicyKey> = {
   post: 'quota.post',
@@ -29,6 +31,8 @@ const POLICY_KEY: Record<QuotaAction, PolicyKey> = {
   proposal: 'quota.proposal_per_week',
   invite: 'quota.invite_per_month',
   claim: 'quota.active_claims',
+  profile: 'quota.profile_per_day',
+  credential: 'quota.credential_per_day',
 };
 
 export interface CitizenQuotaContext {
@@ -171,6 +175,19 @@ export function activeClaimsGuard(
  * spent deadline so /api/whoami and the viewer stop showing a freeze that is
  * over; it is bookkeeping, and this statement is the authority.
  */
+/**
+ * Refuse a key that has been rotated away or has left, without refusing a
+ * frozen one. `lookupPubkey` refuses departed keys too, but only when it is
+ * consulted: a request carrying its own pubkey header never reaches it. So on
+ * the routes that must stay open to a frozen citizen — appeals, and pulling
+ * back a credential after a key compromise — the check runs inside the batch.
+ */
+export function notDepartedGuard(db: D1Database, citizenId: string): D1PreparedStatement {
+  return db
+    .prepare(`UPDATE citizens SET id = id WHERE id = ? AND status <> 'departed'`)
+    .bind(citizenId);
+}
+
 export function notFrozenGuard(
   db: D1Database,
   citizenId: string,

@@ -293,7 +293,35 @@ export async function handleMcp(request: Request, env: Env): Promise<Response> {
     return json({ error: 'method_not_allowed' }, 405, { allow: 'POST, OPTIONS' });
   }
 
+  // The door's body limit is a governed parameter and REST enforces it on
+  // every request. This endpoint enforced nothing at all: `verify_credential`
+  // takes no signature, so `verifyToolCall`'s limit never ran, and a 2 MB
+  // document that REST refused with 400 was canonicalized, hashed and Ed25519
+  // verified here for free, unauthenticated, from any origin.
+  const policy = new Policy(env.DB);
+  const maxBody = await policy.num('request.max_body_bytes');
+  const declared = Number(request.headers.get('content-length') ?? NaN);
+  if (Number.isFinite(declared) && declared > maxBody) {
+    return rpcError(
+      null,
+      INVALID_REQUEST,
+      `body exceeds ${maxBody} bytes (request.max_body_bytes)`,
+      undefined,
+      413,
+    );
+  }
+
   const raw = await request.text();
+  if (new TextEncoder().encode(raw).byteLength > maxBody) {
+    return rpcError(
+      null,
+      INVALID_REQUEST,
+      `body exceeds ${maxBody} bytes (request.max_body_bytes)`,
+      undefined,
+      413,
+    );
+  }
+
   let message: unknown;
   try {
     message = JSON.parse(raw);
@@ -329,7 +357,16 @@ export async function handleMcp(request: Request, env: Env): Promise<Response> {
     return new Response(null, { status: 202, headers: CORS_HEADERS });
   }
 
-  const ctx: ToolContext = { db: env.DB, env, policy: new Policy(env.DB) };
+  // Tools that hand back documents someone will carry elsewhere need to name
+  // this instance by URL. Taken from the request rather than configured,
+  // because the same Worker answers on localhost, on workers.dev, and on the
+  // custom domain, and a credential that cites the wrong one is useless.
+  const ctx: ToolContext = {
+    db: env.DB,
+    env,
+    policy,
+    origin: new URL(request.url).origin,
+  };
 
   switch (method) {
     case 'initialize': {

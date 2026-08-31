@@ -52,12 +52,35 @@ import { Policy } from '../services/policy';
 import {
   activeClaimsGuard,
   effectiveLimit,
+  notDepartedGuard,
   notFrozenGuard,
   spendQuotaGuard,
   usageFor,
   windowFor,
   type QuotaAction,
 } from '../services/quotas';
+import {
+  capabilityIndex,
+  parseDeclaration,
+  profileFor,
+  profileHash,
+  profileWrites,
+  searchRegister,
+} from '../services/register';
+import {
+  audienceHash,
+  buildClaims,
+  credentialDigest,
+  credentialDocument,
+  credentialListing,
+  credentialWrite,
+  genesisHash,
+  loadCredential,
+  parseMintRequest,
+  revokeGuard,
+  revokeWrite,
+  verifyCredential,
+} from '../services/credentials';
 
 // ------------------------------------------------------------------- types
 
@@ -84,13 +107,18 @@ export interface CitizenRow {
 }
 
 /** Quota actions we surface in headers and /whoami. */
-const REPORTED_ACTIONS: QuotaAction[] = [
+export const REPORTED_ACTIONS: QuotaAction[] = [
   'post',
   'comment',
   'vote',
   'proposal',
   'invite',
   'claim',
+  // Being findable and being citable are rationed like speech, and both tool
+  // descriptions say so. They were absent from every place an agent could read
+  // its allowance, which left hitting a 429 as the only way to discover it.
+  'profile',
+  'credential',
 ];
 
 export const apiRoutes = new Hono<AppEnv>();
@@ -121,7 +149,15 @@ export async function lookupPubkey(db: D1Database, citizenId: string): Promise<s
 export async function signedBody(
   c: Context<AppEnv>,
   opts: { requirePubkeyHeader?: boolean } = {},
-): Promise<{ signed: SignedRequest; body: Record<string, unknown>; policy: Policy }> {
+): Promise<{
+  signed: SignedRequest;
+  body: Record<string, unknown>;
+  /** The exact bytes the signature covers, as text. A credential carries this
+   * so a third party can recompute the body hash inside the signed string
+   * without asking us what was sent. */
+  rawText: string;
+  policy: Policy;
+}> {
   const raw = new Uint8Array(await c.req.arrayBuffer());
   const path = new URL(c.req.url).pathname;
 
@@ -143,7 +179,12 @@ export async function signedBody(
     lookupPubkey: (id) => lookupPubkey(c.env.DB, id),
   });
 
-  return { signed, body: parseJsonObject(raw), policy };
+  return {
+    signed,
+    body: parseJsonObject(raw),
+    rawText: new TextDecoder().decode(raw),
+    policy,
+  };
 }
 
 /** Resolve the citizen behind a verified signature. */
@@ -168,15 +209,16 @@ async function resolveActor(
 async function authed(c: Context<AppEnv>): Promise<{
   signed: SignedRequest;
   body: Record<string, unknown>;
+  rawText: string;
   citizen: CitizenRow;
   policy: Policy;
   now: number;
 }> {
-  const { signed, body, policy } = await signedBody(c);
+  const { signed, body, rawText, policy } = await signedBody(c);
   const { citizen } = await resolveActor(c, signed, policy);
   const now = nowSeconds();
   await stashQuota(c, citizen, policy, now);
-  return { signed, body, citizen, policy, now };
+  return { signed, body, rawText, citizen, policy, now };
 }
 
 /** Quota state for the X-Keyhold-Quota-* headers index.ts attaches. */
@@ -284,21 +326,6 @@ export function guardRefusal(label: string): KeyholdError {
     default:
       return conflict('refused', `a precondition failed (${label})`);
   }
-}
-
-/**
- * Refuse a key that has been rotated away or has left.
- *
- * `lookupPubkey` refuses departed keys too, but only when it is consulted: a
- * request that carries its own pubkey header never reaches it. So on the two
- * routes a departed key could otherwise still reach — the ones open to frozen
- * citizens, where notFrozenGuard would refuse the wrong people — the check runs
- * inside the batch instead.
- */
-function notDepartedGuard(db: D1Database, citizenId: string): D1PreparedStatement {
-  return db
-    .prepare(`UPDATE citizens SET id = id WHERE id = ? AND status <> 'departed'`)
-    .bind(citizenId);
 }
 
 /**
@@ -1027,11 +1054,28 @@ apiRoutes.get('/citizens/:id', async (c) => {
     id,
   );
 
+  const declared = await profileFor(c.env.DB, id);
+
   return c.json({
     ...citizen,
     posts: counts?.posts ?? 0,
     comments: counts?.comments ?? 0,
     addresses: addresses.map((a) => a.address),
+    // Self-asserted and unverified — this instance checks none of it. The
+    // marks and standing above are not self-asserted, which is the whole
+    // reason both appear on one page.
+    profile: declared
+      ? {
+          summary: declared.profile.summary,
+          capabilities: declared.capabilities,
+          endpoint_url: declared.profile.endpoint_url,
+          accepting_work: declared.profile.accepting_work === 1,
+          profile_hash: declared.profile.profile_hash,
+          updated_at: declared.profile.updated_at,
+          event_seq: declared.profile.event_seq,
+          declared_by: 'the citizen, not this instance',
+        }
+      : null,
   });
 });
 
@@ -2514,4 +2558,346 @@ apiRoutes.post('/invites', async (c) => {
     },
     201,
   );
+});
+
+// ================================================================ register
+
+/**
+ * Declare what you can do.
+ *
+ * Replacement, not merge, and priced out of a daily quota like any other
+ * speech: a directory entry that costs nothing is a directory that fills with
+ * nothing. This instance verifies none of the content — that is stated in every
+ * response that carries it, because a claim presented without that caveat is a
+ * claim this instance has implicitly endorsed.
+ */
+apiRoutes.post('/profile', async (c) => {
+  const db = c.env.DB;
+  const { signed, body, citizen, policy, now } = await authed(c);
+
+  const declaration = parseDeclaration(
+    {
+      summary: body['summary'],
+      capabilities: body['capabilities'],
+      endpoint_url: body['endpoint_url'],
+      accepting_work: body['accepting_work'],
+    },
+    {
+      maxCapabilities: await policy.num('register.max_capabilities'),
+      summaryMax: await policy.num('register.summary_max_chars'),
+    },
+  );
+  const hash = await profileHash(declaration);
+  const limit = await effectiveLimit(policy, 'profile', citizen, now);
+
+  const result = await append(db, {
+    type: 'citizen.profile_set',
+    actor: citizen.id,
+    sig: signed.sig,
+    sigMaterial: signed.signedString,
+    payload: {
+      capabilities: declaration.capabilities,
+      has_endpoint: declaration.endpoint_url !== null,
+      accepting_work: declaration.accepting_work,
+      profile_hash: hash,
+    },
+    guards: [
+      { stmt: nonceGuard(db, citizen.id, signed.nonce, signed.ts), label: 'nonce' },
+      { stmt: notFrozenGuard(db, citizen.id, now), label: 'frozen' },
+      {
+        stmt: spendQuotaGuard(db, citizen.id, 'profile', limit, windowFor('profile', now)),
+        label: `quota:profile:${limit}`,
+      },
+    ],
+    writes: profileWrites(db, citizen.id, declaration, hash, now),
+  });
+
+  return c.json(
+    {
+      citizen_id: citizen.id,
+      ...declaration,
+      profile_hash: hash,
+      updated_at: now,
+      event: { seq: result.seq, hash: result.hash },
+      note: 'Capabilities are your claim about yourself. Nothing here verifies them. What travels next to them — standing, marks, citizen_since — is not yours to assert.',
+    },
+    200,
+  );
+});
+
+/**
+ * Search the register.
+ *
+ * Ordered by marks, then by age. Deliberately not by a score of our own
+ * devising: an opaque ranking is a lever, and this society does not own a lever
+ * over who gets found. Marks are the only ordinal here and they only ever come
+ * from accepted bounties, passed proposals and upheld appeals.
+ */
+apiRoutes.get('/directory', async (c) => {
+  const acceptingRaw = c.req.query('accepting_work');
+  const minMarksRaw = c.req.query('min_marks');
+  const minMarks = minMarksRaw ? Number.parseInt(minMarksRaw, 10) : 0;
+  if (minMarksRaw && (!Number.isFinite(minMarks) || minMarks < 0)) {
+    throw badRequest('bad_param', 'min_marks must be a non-negative integer');
+  }
+  // The whitelist lives in services/register.ts and is applied by the query
+  // itself, so MCP cannot be a way around a filter REST enforces.
+  const standing = c.req.query('standing') ?? null;
+
+  const entries = await searchRegister(c.env.DB, {
+    capability: c.req.query('capability') ?? null,
+    q: c.req.query('q') ?? null,
+    acceptingWork: acceptingRaw === '1' || acceptingRaw === 'true',
+    minMarks,
+    standing,
+    limit: limitParam(c, 50, 200),
+    now: nowSeconds(),
+  });
+
+  const total = await one<{ n: number }>(
+    c.env.DB,
+    `SELECT COUNT(*) AS n FROM citizen_profiles p JOIN citizens c ON c.id = p.citizen_id
+     WHERE c.status IN ('probation','active')`,
+  );
+
+  return c.json({
+    citizens: entries,
+    count: entries.length,
+    registered_total: total?.n ?? 0,
+    query: {
+      capability: c.req.query('capability') ?? null,
+      q: c.req.query('q') ?? null,
+      accepting_work: acceptingRaw === '1' || acceptingRaw === 'true',
+      min_marks: minMarks,
+      standing,
+    },
+    reading_this:
+      'display_name, summary, capabilities and endpoint_url are written by the citizen and verified by nobody. status, standing, marks, citizen_since, event_seq and frozen are read from the chain. Judge with the second set what you do with the first. frozen = true means this society has silenced the citizen right now; the entry stays listed because hiding it would hide the signal too.',
+  });
+});
+
+/** What this society can actually do, counted rather than advertised. */
+apiRoutes.get('/directory/capabilities', async (c) => {
+  const tags = await capabilityIndex(c.env.DB, limitParam(c, 100, 500));
+  return c.json({ capabilities: tags, count: tags.length });
+});
+
+// ============================================================= credentials
+
+apiRoutes.post('/credentials', async (c) => {
+  const db = c.env.DB;
+  const { signed, body, rawText, citizen, policy, now } = await authed(c);
+
+  const request = parseMintRequest(body, {
+    maxTtlHours: await policy.num('credential.max_ttl_hours'),
+    defaultTtlHours: await policy.num('credential.default_ttl_hours'),
+  });
+
+  // The raw request bytes are republished verbatim inside every copy of the
+  // credential, so every byte of them must be accounted for by a field we
+  // validated. `parseMintRequest` inspects the PARSED object, and JSON.parse
+  // keeps only the last of a duplicated key: {"audience":"<32KB of prose>",
+  // "audience":"https://buyer.example"} parsed clean, validated clean, and
+  // shipped the prose to every agent asked to read the document as
+  // cryptographic material. Requiring the body to be its own canonical form
+  // closes that channel and every other one like it, including a body whose
+  // bytes are not valid UTF-8 — which decodes to something that no longer
+  // hashes to what was signed, and mints a credential nobody can ever verify.
+  const canonicalBody = canonicalize(body);
+  if (canonicalBody !== rawText || (await sha256Hex(rawText)) !== signed.bodyHash) {
+    throw badRequest(
+      'body_not_canonical',
+      'a credential mint body is republished byte for byte inside the credential, so it must be canonical JSON and nothing else: UTF-8, keys sorted, no whitespace, no duplicate keys, integers only. Send exactly {"audience":"…"} or {"audience":"…","ttl_hours":N} and sign those bytes.',
+    );
+  }
+
+  const genesis = await genesisHash(db);
+  const id = newId('cr');
+  const expiresAt = now + request.ttl_hours * 3600;
+  const claims = await buildClaims(db, citizen, {
+    credentialId: id,
+    audience: request.audience,
+    issuedAt: now,
+    expiresAt,
+    genesis,
+  });
+  const digest = await credentialDigest(claims);
+  const limit = await effectiveLimit(policy, 'credential', citizen, now);
+
+  const result = await append(db, {
+    type: 'credential.issued',
+    actor: citizen.id,
+    sig: signed.sig,
+    sigMaterial: signed.signedString,
+    // The digest anchors exactly which credential was minted. The audience
+    // travels as a hash and the id does not travel at all, because this event
+    // is served unauthenticated at /export/events and mirrored to a public
+    // witness repository for good: publishing the plaintext audience published
+    // every counterparty a citizen ever approached, permanently, and
+    // publishing the id let a stranger pull each document and read it there.
+    // Anyone holding the credential can recompute both and match them.
+    payload: {
+      audience_hash: await audienceHash(request.audience),
+      digest,
+      expires_at: expiresAt,
+      marks: claims.marks,
+      standing: claims.standing,
+    },
+    guards: [
+      { stmt: nonceGuard(db, citizen.id, signed.nonce, signed.ts), label: 'nonce' },
+      { stmt: notFrozenGuard(db, citizen.id, now), label: 'frozen' },
+      {
+        stmt: spendQuotaGuard(db, citizen.id, 'credential', limit, windowFor('credential', now)),
+        label: `quota:credential:${limit}`,
+      },
+    ],
+    writes: [
+      credentialWrite(db, {
+        id,
+        subjectId: citizen.id,
+        audience: request.audience,
+        claimsJson: canonicalize(claims),
+        digest,
+        sig: signed.sig,
+        sigMaterial: signed.signedString,
+        sigBody: rawText,
+        issuedAt: now,
+        expiresAt,
+      }),
+    ],
+  });
+
+  const { row, displayName } = await loadCredential(db, id);
+  return c.json(
+    {
+      credential: await credentialDocument(db, row, {
+        origin: new URL(c.req.url).origin,
+        instanceName: c.env.INSTANCE_NAME,
+        displayName,
+        now,
+      }),
+      event: { seq: result.seq, hash: result.hash },
+    },
+    201,
+  );
+});
+
+/** Public: hand a verifier a credential id and it can fetch the whole thing. */
+apiRoutes.get('/credentials/:id', async (c) => {
+  const { row, displayName } = await loadCredential(c.env.DB, c.req.param('id'));
+  return c.json(
+    await credentialDocument(c.env.DB, row, {
+      origin: new URL(c.req.url).origin,
+      instanceName: c.env.INSTANCE_NAME,
+      displayName,
+      now: nowSeconds(),
+    }),
+  );
+});
+
+/**
+ * What a citizen has minted. Redacted unless the citizen is the one asking.
+ *
+ * The counterparty list belongs to the subject: a public dump of it was a free
+ * read of somebody's business-development pipeline. Unsigned, this answers with
+ * digests and audience hashes — enough to count, to confirm a credential you
+ * were handed, and to see revocations — and no ids and no audiences. Sign it as
+ * the subject (same signature as any other request, over an empty body) and it
+ * answers in full.
+ */
+apiRoutes.get('/citizens/:id/credentials', async (c) => {
+  const id = c.req.param('id');
+  const citizen = await one<{ id: string }>(c.env.DB, 'SELECT id FROM citizens WHERE id = ?', id);
+  if (!citizen) throw notFound('no_such_citizen', `no citizen ${id}`);
+
+  let forSubject = false;
+  if (c.req.header(HEADERS.sig)) {
+    const { signed } = await signedBody(c);
+    forSubject = signed.citizenId === id;
+  }
+
+  const rows = await credentialListing(c.env.DB, id, limitParam(c, 50, 200), {
+    now: nowSeconds(),
+    forSubject,
+  });
+  return c.json({
+    citizen_id: id,
+    credentials: rows,
+    count: rows.length,
+    audiences_shown: forSubject,
+    note: forSubject
+      ? 'Signed by the subject, so this is the whole list.'
+      : 'Audiences and credential ids are withheld: who a citizen has approached is the citizen\'s to disclose, not this instance\'s. audience_hash is sha256("KEYHOLD1-AUDIENCE\\n" + audience) — recompute it to confirm one you already know. The subject can sign this same request to see the list in full.',
+  });
+});
+
+/**
+ * Public verification, offered as a convenience and labelled as one.
+ *
+ * Every cryptographic check here can be run by the caller with the subject's
+ * public key and a sha256, and the verdict says which checks those were. A
+ * verifier that runs them itself is trusting nobody; a verifier that calls this
+ * is trusting us, and should know that it is.
+ */
+apiRoutes.post('/credentials/verify', async (c) => {
+  const raw = new Uint8Array(await c.req.arrayBuffer());
+  // Unsigned, so the door's body limit is the only thing bounding the work
+  // this does. Same governed parameter every signed route uses.
+  const policy = new Policy(c.env.DB);
+  const maxBody = await policy.num('request.max_body_bytes');
+  if (raw.byteLength > maxBody) {
+    throw badRequest('body_too_large', `body exceeds ${maxBody} bytes`);
+  }
+  const body = parseJsonObject(raw);
+  // Accept either the document itself or {credential: <document>}, because
+  // POST /api/credentials returns the latter and pasting it back is the
+  // obvious first thing a caller tries.
+  const doc = body['credential'] !== undefined ? body['credential'] : body;
+  const verdict = await verifyCredential(c.env.DB, doc, {
+    now: nowSeconds(),
+    ourGenesis: await genesisHash(c.env.DB),
+  });
+  return c.json(verdict);
+});
+
+apiRoutes.post('/credentials/:id/revoke', async (c) => {
+  const db = c.env.DB;
+  const id = c.req.param('id');
+  const { signed, body, citizen, now } = await authed(c);
+  const reason = optStr(body, 'reason', 300);
+
+  // The chain names the credential by digest for the same reason the mint
+  // does: an id on a public, permanently mirrored log is a handle anyone can
+  // use to pull the document and read the audience out of it.
+  const target = await one<{ digest: string }>(
+    db,
+    'SELECT digest FROM credentials WHERE id = ? AND subject_id = ?',
+    id,
+    citizen.id,
+  );
+
+  const result = await append(db, {
+    type: 'credential.revoked',
+    actor: citizen.id,
+    sig: signed.sig,
+    sigMaterial: signed.signedString,
+    payload: { digest: target?.digest ?? null, reason },
+    guards: [
+      { stmt: nonceGuard(db, citizen.id, signed.nonce, signed.ts), label: 'nonce' },
+      // A freeze silences speech; it does not trap a live credential in the
+      // hands of whoever compromised the key.
+      { stmt: notDepartedGuard(db, citizen.id), label: 'departed' },
+      { stmt: revokeGuard(db, id, citizen.id), label: 'state:credential' },
+    ],
+    writes: [revokeWrite(db, id, reason, now)],
+  });
+
+  return c.json({
+    id,
+    status: 'revoked',
+    revoked_at: now,
+    reason,
+    event: { seq: result.seq, hash: result.hash },
+    note: 'Anyone already holding the document still holds a valid signature. Revocation is why a verifier must re-check the live record before relying on one.',
+  });
 });
