@@ -125,6 +125,13 @@ npx wrangler deploy
 node scripts/kh.mjs <operator-key> POST /genesis '{"instance_name":"Your Society"}'
 ```
 
+A fine-grained `GITHUB_TOKEN` expires (30 days by default), and when it does
+every nightly push fails while the checkpoints keep landing on the chain. Put a
+new one with `wrangler secret put GITHUB_TOKEN`; the next nightly run clears the
+backlog seven days at a time, oldest first, or the operator can clear it now with
+`POST /admin/checkpoint?repair=10`. Each late day is committed as "witnessed
+late", and the verifier warns about any server checkpoint the witness never got.
+
 Your instance is a **different society**, distinguished by its own genesis hash.
 That is a feature: forking is a right here, and the exit is what keeps the
 operator honest. Take your key and your history with you.

@@ -18,8 +18,9 @@
  *
  * The witness push is best-effort by design: GitHub being down must not stop
  * the society recording its own checkpoint. When the push fails the row lands
- * with a null witness_url and the next run repairs it — with its own event, so
- * the repair is on the record too.
+ * with a null witness_url and a later run repairs it — the same day, or any
+ * day after through repairUnwitnessed — with its own event, so the repair is
+ * on the record too.
  */
 
 import { one } from '../core/db';
@@ -149,8 +150,11 @@ export async function publishCheckpoint(
     // The day is on the chain but never reached the public repo. Re-push the
     // record exactly as it was recorded — not a fresh snapshot, or the witness
     // would disagree with the checkpoint event that is already in the log.
+    // A past day is said to be late in the commit message: git dates the
+    // commit to now, and the message should not let that read as on time.
     const record = await recordFor(db, env, existing);
-    const witness = await witnessCheckpoint(env, record);
+    const today = utcDay(now);
+    const witness = await witnessCheckpoint(env, record, day < today ? today : undefined);
     if (!witness.pushed || !witness.url) {
       return { record, event_seq: null, witness, already_published: false, repaired: false };
     }
@@ -245,7 +249,11 @@ export async function publishCheckpoint(
  * chain whether or not the witness is reachable. `pushed: false` plus a reason
  * is the honest answer, and the next run repairs it.
  */
-async function witnessCheckpoint(env: Env, record: CheckpointRecord): Promise<PushResult> {
+async function witnessCheckpoint(
+  env: Env,
+  record: CheckpointRecord,
+  lateOn?: string,
+): Promise<PushResult> {
   if (!witnessTarget(env)) {
     return { pushed: false, reason: 'WITNESS_REPO is not set; this instance publishes no public witness' };
   }
@@ -254,13 +262,14 @@ async function witnessCheckpoint(env: Env, record: CheckpointRecord): Promise<Pu
   }
 
   const path = `checkpoints/${record.date}.json`;
+  const late = lateOn ? ` (witnessed late, ${lateOn})` : '';
   let result: PushResult;
   try {
     result = await pushFile(
       env,
       path,
       JSON.stringify(record, null, 2) + '\n',
-      `checkpoint ${record.date}: seq ${record.last_seq} @ ${record.last_hash.slice(0, 12)}`,
+      `checkpoint ${record.date}${late}: seq ${record.last_seq} @ ${record.last_hash.slice(0, 12)}`,
     );
   } catch (err) {
     return { pushed: false, reason: `witness push failed: ${errText(err)}` };
@@ -268,7 +277,7 @@ async function witnessCheckpoint(env: Env, record: CheckpointRecord): Promise<Pu
 
   if (result.pushed) {
     try {
-      await updateIndex(env, record);
+      await updateIndex(env, record, late);
     } catch (err) {
       // The day file is what proves the chain; the index is only a directory
       // listing for verifiers. Say it failed, keep the successful push.
@@ -284,7 +293,7 @@ async function witnessCheckpoint(env: Env, record: CheckpointRecord): Promise<Pu
  * has been published. Run the verifier with --full and it re-fetches every day
  * file, so a doctored index cannot hide a doctored day.
  */
-async function updateIndex(env: Env, record: CheckpointRecord): Promise<void> {
+async function updateIndex(env: Env, record: CheckpointRecord, late = ''): Promise<void> {
   const path = 'checkpoints/index.json';
   const existing = await readJson<{ checkpoints?: CheckpointRecord[] }>(env, path);
   const rows = (existing?.checkpoints ?? []).filter((r) => r.date !== record.date);
@@ -297,7 +306,70 @@ async function updateIndex(env: Env, record: CheckpointRecord): Promise<void> {
     updated_at: record.date,
     checkpoints: rows.slice(-INDEX_CAP),
   };
-  await pushFile(env, path, JSON.stringify(body, null, 2) + '\n', `index: ${record.date}`);
+  await pushFile(env, path, JSON.stringify(body, null, 2) + '\n', `index: ${record.date}${late}`);
+}
+
+// ------------------------------------------------------------- backlog repair
+
+/**
+ * Past days are re-pushed a few per run, oldest first. Each costs four GitHub
+ * subrequests (read + write the day file, read + write the index), and the
+ * nightly invocation shares the Workers subrequest budget with today's
+ * checkpoint and the weekly export. A month-long outage clears in under a week.
+ */
+export const REPAIR_PER_RUN = 7;
+
+export interface RepairResult {
+  /** Days that reached the witness on this run, each with its repair event. */
+  repaired: string[];
+  /** Unwitnessed past days still waiting after this run. */
+  remaining: number;
+  problems: string[];
+}
+
+/**
+ * Re-push earlier days whose checkpoint is on the chain but never reached the
+ * public repo.
+ *
+ * publishCheckpoint repairs only the day it is asked about, and the cron asks
+ * about today — so a push that failed stayed unwitnessed forever once its UTC
+ * day ended. An expired token therefore cost every day of the outage, not just
+ * the first, and renewing the token repaired nothing.
+ *
+ * Only days that already have a row are touched, through publishCheckpoint's
+ * repair path: the published record is the one the chain recorded at the time,
+ * never a fresh snapshot backdated to a day that has passed.
+ */
+export async function repairUnwitnessed(
+  env: Env,
+  opts: { now?: number; limit?: number } = {},
+): Promise<RepairResult> {
+  const db = env.DB;
+  const now = opts.now ?? nowSeconds();
+  const today = utcDay(now);
+  const limit = opts.limit ?? REPAIR_PER_RUN;
+
+  const backlog = await db
+    .prepare('SELECT day FROM checkpoints WHERE witness_url IS NULL AND day < ? ORDER BY day')
+    .bind(today)
+    .all<{ day: string }>();
+  const days = (backlog.results ?? []).map((r) => r.day);
+
+  const repaired: string[] = [];
+  const problems: string[] = [];
+  for (const day of days.slice(0, limit)) {
+    const result = await publishCheckpoint(env, { day, now });
+    if (!result.witness.pushed) {
+      // The witness is down for this day, so it is down for the rest: stop
+      // rather than spend the run collecting the same failure.
+      problems.push(`repair ${day}: ${result.witness.reason ?? 'witness push did not report success'}`);
+      break;
+    }
+    if (result.witness.reason) problems.push(`repair ${day}: ${result.witness.reason}`);
+    repaired.push(day);
+  }
+
+  return { repaired, remaining: days.length - repaired.length, problems };
 }
 
 // -------------------------------------------------------------- weekly export
@@ -424,6 +496,8 @@ async function pushExportIndex(env: Env, entry: ExportIndexEntry): Promise<void>
 
 export interface WitnessJobResult {
   checkpoint: CheckpointResult;
+  /** Absent when today's push failed: the backlog waits for a working witness. */
+  repairs?: RepairResult;
   export?: ExportResult;
   /** Everything that did not work, for the cron log. Empty means clean. */
   problems: string[];
@@ -440,7 +514,7 @@ export interface WitnessJobResult {
  */
 export async function dailyWitnessJob(
   env: Env,
-  opts: { now?: number; weeklyOn?: number; force_export?: boolean } = {},
+  opts: { now?: number; weeklyOn?: number; force_export?: boolean; repair_limit?: number } = {},
 ): Promise<WitnessJobResult> {
   const now = opts.now ?? nowSeconds();
   const problems: string[] = [];
@@ -450,6 +524,14 @@ export async function dailyWitnessJob(
     problems.push(checkpoint.witness.reason ?? 'witness push did not report success');
   } else if (checkpoint.witness.reason) {
     problems.push(checkpoint.witness.reason);
+  }
+
+  // Today first, then the backlog — and only once today's push has shown the
+  // witness is reachable again.
+  let repairs: RepairResult | undefined;
+  if (checkpoint.witness.pushed) {
+    repairs = await repairUnwitnessed(env, { now, limit: opts.repair_limit });
+    problems.push(...repairs.problems);
   }
 
   // Sunday by default, so the export and the checkpoint describe the same head.
@@ -465,7 +547,7 @@ export async function dailyWitnessJob(
     }
   }
 
-  return { checkpoint, export: exported, problems, witness_base: witnessBaseUrl(env) };
+  return { checkpoint, repairs, export: exported, problems, witness_base: witnessBaseUrl(env) };
 }
 
 // ------------------------------------------------------------------ internals

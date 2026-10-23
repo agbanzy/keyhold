@@ -1293,9 +1293,13 @@ adminRoutes.get('/invites', async (c) => {
 adminRoutes.post('/checkpoint', async (c) => {
   const { now } = await admin(c, 'operator');
 
+  // `?repair=N` clears up to N past unwitnessed days in this call, capped so one
+  // request stays inside the Workers subrequest budget at four per day.
+  const repair = Number.parseInt(c.req.query('repair') ?? '', 10);
   const result = await dailyWitnessJob(c.env, {
     now,
     force_export: c.req.query('export') === '1',
+    repair_limit: Number.isFinite(repair) ? Math.min(Math.max(repair, 0), 10) : undefined,
   });
 
   const witnessed = result.checkpoint.witness.pushed;
@@ -1305,6 +1309,7 @@ adminRoutes.post('/checkpoint', async (c) => {
       witnessed,
       witness_base: result.witness_base,
       already_published: result.checkpoint.already_published,
+      repairs: result.repairs ?? null,
       export: result.export ?? null,
       problems: result.problems,
       note: witnessed

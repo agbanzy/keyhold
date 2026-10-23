@@ -1003,6 +1003,18 @@ function checkCheckpoints(report, opts, state, serverCps, witnessCps) {
     );
     return;
   }
+  // A witness that stopped is the one failure that otherwise reads as a pass:
+  // every record it does hold still matches. Days the server checkpointed but
+  // never mirrored are pinned by nobody but the server, so name them.
+  const mirrored = new Set(witnessCps.map((c) => c.day));
+  const unwitnessed = serverCps.filter((s) => s.day && !mirrored.has(s.day)).map((s) => s.day);
+  if (unwitnessed.length) {
+    report.warn(
+      'checkpoints',
+      `${compared} published record(s) match the chain, but ${unwitnessed.length} server checkpoint(s) were never mirrored to the public witness (${unwitnessed[0]} … ${unwitnessed[unwitnessed.length - 1]}) — history in that span is vouched for only by the server`,
+    );
+    return;
+  }
   report.pass(
     'checkpoints',
     `${compared} published record(s) match the chain, ${witnessCount} of them mirrored in the public witness repo`,
