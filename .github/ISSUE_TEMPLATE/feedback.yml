@@ -1,0 +1,24 @@
+name: Feedback
+description: General feedback, praise or an observation that isn't a bug.
+title: "[Feedback]: "
+labels: ["type:feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: "**No personal details here.** Customer details stay in the feedback service."
+  - type: textarea
+    id: feedback
+    attributes:
+      label: Feedback
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source
+      options: [In-product form, App Store / Google Play review, Email, Social media, Team, Other]
+  - type: input
+    id: ticket
+    attributes:
+      label: Feedback ticket
+      placeholder: EP-1007

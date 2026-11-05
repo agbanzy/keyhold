@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest something new or a change. Built only after the spec is approved.
+title: "[Feature]: "
+labels: ["type:feature", "needs-spec"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests pass a **spec gate**: a story and spec are written first, and nothing is built until the owner adds the `approved` label.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does it solve?
+      description: Who has the problem, and what does it cost them today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What should we build?
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Feedback tickets, store reviews, numbers, competitor examples.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

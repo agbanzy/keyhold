@@ -1,0 +1,46 @@
+name: Complaint
+description: Log a customer complaint (it has an SLA).
+title: "[Complaint]: "
+labels: ["type:complaint"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Complaints have an SLA: **acknowledge within 24 hours; resolve P0 in 3 days, P1 in 7 days.**
+        **No personal details here.** If the complaint came by phone, WhatsApp, email or in person, log it in the feedback service first so the customer gets a ticket number and updates, then reference the ticket below.
+  - type: input
+    id: ticket
+    attributes:
+      label: Feedback ticket
+      placeholder: GD-1042
+  - type: dropdown
+    id: urgency
+    attributes:
+      label: Urgency
+      options:
+        - "P0: money, data, safety or legal exposure"
+        - "P1: service not delivered or badly delayed"
+        - "P2: poor experience, no loss"
+    validations:
+      required: true
+  - type: dropdown
+    id: channel
+    attributes:
+      label: How did it reach us?
+      options: [In-product form, Phone, WhatsApp, Email, Social media, App Store / Google Play review, In person, Other]
+  - type: textarea
+    id: what
+    attributes:
+      label: What went wrong?
+      description: Facts only (dates, amounts, reference numbers), no personal details.
+    validations:
+      required: true
+  - type: textarea
+    id: wants
+    attributes:
+      label: What does the customer want?
+      description: Refund, fix, explanation, apology, account change …
+  - type: textarea
+    id: actions
+    attributes:
+      label: What has been done so far?
