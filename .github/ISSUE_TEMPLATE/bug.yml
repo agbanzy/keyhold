@@ -1,0 +1,53 @@
+name: Bug report
+description: Something isn't working.
+title: "[Bug]: "
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Keep personal details out of GitHub.** No names, phone numbers, emails, NIN/BVN, card or account numbers. Customers report through the in-product **Feedback** button; their details stay in the feedback service and the issue links to the record.
+  - type: dropdown
+    id: severity
+    attributes:
+      label: How bad is it?
+      options:
+        - "P0: down, or money / data / safety at risk"
+        - "P1: a main feature is broken"
+        - "P2: broken, but there is a workaround"
+        - "P3: minor or cosmetic"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw, and what you expected to see instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Go to …
+        2. Tap …
+        3. See error …
+  - type: input
+    id: where
+    attributes:
+      label: Where?
+      description: URL path, app screen, and app or build version.
+      placeholder: "/filings/:id · Android app 1.4.2 (52)"
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      multiple: true
+      options: [Web, Android, iOS, Desktop, API / backend]
+  - type: input
+    id: ticket
+    attributes:
+      label: Feedback ticket
+      description: The customer's ticket number, if this came from one.
+      placeholder: DF-1042
